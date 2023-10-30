@@ -156,11 +156,14 @@ class PPOTrainer:
         vf_loss = .5 * reduce_mean(torch.max(vf_losses1, vf_losses2), mask)
         vf_loss = vf_loss * weight
 
-        loss = self.args['ppo']['pg_coef'] * pg_loss + self.args['ppo']['vf_coef'] * vf_loss
+        loss = self.args['ppo']['pg_coef'] * pg_loss + self.args['ppo']['vf_coef'] * vf_loss + self.ppo_loss_augmentation(policy_inputs=forward_inputs, policy_outputs=policy_forward, value_outputs=new_values)
 
         results['loss/total'] = loss
         results['loss/policy'] = pg_loss
         results['loss/value'] = vf_loss
+
+    def ppo_loss_augmentation(self, policy_inputs=None, policy_outputs=None, value_outputs=None):
+        return 0.0
 
     def train(self, step):
         if step % self.args['train']['eval_interval'] == 0:
