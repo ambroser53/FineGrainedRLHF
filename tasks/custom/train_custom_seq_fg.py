@@ -14,7 +14,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import transformers
-import accelerate
 import wandb
 import yaml
 import nltk
@@ -28,13 +27,6 @@ from reward import FineGrainedReward
 
 logging.basicConfig(level=logging.ERROR)
 
-# prepare accelerator and logger
-accelerator = accelerate.Accelerator()
-device = accelerator.device
-log = accelerate.logging.get_logger(__name__, log_level='INFO')
-def log_info(s):
-    if accelerator.is_main_process:
-        log.info(s)
         
 # load parameters
 parser = argparse.ArgumentParser()
@@ -94,8 +86,7 @@ class TextGenDataset(Dataset):
                     "passages": task_instance['passages'],
                     "question": task_instance['question'],}
             })
-        
-        log_info(f'Loaded split {self.split} with {len(instances)} total instances')
+
         
         instances = instances[:len(instances)//self.n_card*self.n_card]  # or Trainer will stuck
         return instances
@@ -135,14 +126,8 @@ def main():
     set_seed(args['train']['seed'], args['train']['cuda_deterministic'])
     
     # set saving directories
-    log_info(f"Write to output directory: {args['logging']['save_dir']}")
-    
-    if accelerator.is_main_process:
-        ensure_dir(args['logging']['save_dir'])
-        # save the config file
-        with open(os.path.join(args['logging']['save_dir'], 'args.json'), 'w') as f:
-            json.dump(args, f, indent=2)
-
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
     
     # initialize policy and value model tokenizers
     tokenizer = transformers.AutoTokenizer.from_pretrained(args['model']['policy_model']['ckpt'], 
@@ -153,46 +138,36 @@ def main():
     
     
     # Load data
-    log_info(f'Loading data ...')
-    train_dataset = TextGenDataset( 'train', tokenizer, accelerator=accelerator)
+    train_dataset = TextGenDataset( 'train', tokenizer)
     # train ds is shuffled in its constructor
     train_dataloader = DataLoader(train_dataset, batch_size=args['train']['sampling_batch_size_per_card'], 
                                   shuffle=False, drop_last=True, collate_fn=train_dataset.collate_fn)
 
-    eval_dataset = TextGenDataset( 'dev',  tokenizer, accelerator=accelerator, length_limit=None)
+    eval_dataset = TextGenDataset( 'dev',  tokenizer, length_limit=None)
     eval_dataloader = DataLoader(eval_dataset, batch_size=args['train']['sampling_batch_size_per_card'], 
                                  shuffle=False, drop_last=False, collate_fn=eval_dataset.collate_fn)
 
-    train_dataloader, eval_dataloader = accelerator.prepare(train_dataloader, eval_dataloader)
 
 
     # Initialize models and optimizer
-    log_info(f'Initializing models ...')
 
     ref_policy = T5Policy(
         model_ckpt=args['model']['policy_model']['ckpt'],
         tokenizer=tokenizer,
         policy_value_sharing=args['model']['value_model']['policy_value_sharing'],
-        accelerator=accelerator,
     )
-    ref_policy.model, ref_policy.linear = accelerator.prepare(ref_policy.model, ref_policy.linear)
     policy = T5Policy(
         model_ckpt=args['model']['policy_model']['ckpt'],
         tokenizer=tokenizer,
         policy_value_sharing=args['model']['value_model']['policy_value_sharing'],
-        accelerator=accelerator,
     )
-    policy.model, policy.linear = accelerator.prepare(policy.model, policy.linear)
     
     value = T5Value(
         model_ckpt=args['model']['value_model']['ckpt'],
         model=policy.model if args['model']['value_model']['policy_value_sharing'] else None,
         tokenizer=tokenizer,
-        accelerator=accelerator,
         freeze_model=False if args['model']['value_model']['policy_value_sharing'] else args['model']['value_model']['freeze_value_model'],
         )
-    if not args['model']['value_model']['policy_value_sharing']:
-        value.model, value.linear = accelerator.prepare(value.model, value.linear)
     
     reward = FineGrainedReward(
         tokenizer=tokenizer,
@@ -200,10 +175,7 @@ def main():
         kl_coef=args['ppo']['kl_coef'],
         sep = "</s>"
     )
-    
-    # prepare reward models
-    for rm_name in reward.reward_models.keys():
-        reward.reward_models[rm_name].model = accelerator.prepare(reward.reward_models[rm_name].model)
+
     
     # prepare optimizers and schedulers
     if args['model']['value_model']['policy_value_sharing']:
@@ -212,16 +184,14 @@ def main():
         parameters = chain(policy.model.parameters(), policy.linear.parameters(), value.model.parameters(), value.linear.parameters())
     optimizer = torch.optim.Adam(parameters, lr=args['train']['lr'], eps=1e-5)
     total_steps = ceil_div(args['train']['total_episodes'], 
-                                args['train']['sampling_batch_size_per_card'] * accelerator.num_processes * args['env']['train_num_samples_per_input'])
+                                args['train']['sampling_batch_size_per_card'] * args['env']['train_num_samples_per_input'])
     
     scheduler = transformers.get_scheduler(
         name='linear',
         optimizer=optimizer,
-        num_warmup_steps=100*args['train']['n_ppo_epoch_per_rollout']*accelerator.num_processes,
-        num_training_steps=total_steps*args['train']['n_ppo_epoch_per_rollout']*accelerator.num_processes,
+        num_warmup_steps=100*args['train']['n_ppo_epoch_per_rollout'],
+        num_training_steps=total_steps*args['train']['n_ppo_epoch_per_rollout'],
     )
-    
-    optimizer, scheduler = accelerator.prepare(optimizer, scheduler)
 
 
     # Set up trainer
@@ -235,20 +205,11 @@ def main():
         reward_model=reward,
         optimizer=optimizer,
         scheduler=scheduler,
-        accelerator=accelerator,
-        log_info=log_info,
     )
     
     steps = list(range(total_steps + 1))
-    steps = tqdm(steps) if accelerator.is_main_process else steps
     for step in steps:
         trainer.train(step)
-        accelerator.wait_for_everyone()
-        # early stopping because KL explodes
-        if trainer.should_early_stop:
-            if accelerator.is_local_main_process:
-                print("Early stopping triggered. Terminating training.")
-            break
             
 if __name__ == '__main__':
     main()

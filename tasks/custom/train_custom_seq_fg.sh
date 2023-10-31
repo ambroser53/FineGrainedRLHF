@@ -1,0 +1,1 @@
+python tasks/custom/train_custom_seq_fg.py --config tasks/custom/custom_config.yml

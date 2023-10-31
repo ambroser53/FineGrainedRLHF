@@ -26,7 +26,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import transformers
-import accelerate
 import wandb
 
 from .utils import ensure_dir, set_seed, reduce_mean, reduce_sum, ceil_div, whiten, clamp
@@ -44,12 +43,8 @@ class PPOTrainer:
                  reward_model,
                  optimizer: torch.optim.Optimizer,
                  scheduler: torch.optim.lr_scheduler._LRScheduler,
-                 accelerator: accelerate.Accelerator,
-                 log_info,
                 ):
         
-        self.accelerator = accelerator
-        self.log_info = log_info
         self.args = args
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
@@ -65,17 +60,16 @@ class PPOTrainer:
         self.huge_kl_count = 0
 
         self.batchify = lambda x, n: [x[i:i + n] for i in range(0, len(x), n)]
-        
-        if self.accelerator.is_main_process:
-            if args['logging']['wandb_log']:
-                wandb.init(entity=args["logging"]["wandb_entity"], project=args["logging"]["wandb_project"], name=args['logging']['run_name'], config=args)
-            else:
-                wandb.init(config=args, mode='disabled')
-            
-            wandb.define_metric('train/step')
-            wandb.define_metric('eval/step')
-            wandb.define_metric('train/*', step_metric='train/step')
-            wandb.define_metric('eval/*', step_metric='eval/step', summary='max')
+
+        if args['logging']['wandb_log']:
+            wandb.init(entity=args["logging"]["wandb_entity"], project=args["logging"]["wandb_project"], name=args['logging']['run_name'], config=args)
+        else:
+            wandb.init(config=args, mode='disabled')
+
+        wandb.define_metric('train/step')
+        wandb.define_metric('eval/step')
+        wandb.define_metric('train/*', step_metric='train/step')
+        wandb.define_metric('eval/*', step_metric='eval/step', summary='max')
 
         self.train_sampler = iter(self.train_dataloader)
         for _ in range(len(self.train_dataloader)):
@@ -92,7 +86,7 @@ class PPOTrainer:
         
         with torch.no_grad():
             if self.args['ppo']['whiten_rewards']:
-                whitened_rewards = whiten(rewards, mask, shift_mean=False, accelerator=self.accelerator)
+                whitened_rewards = whiten(rewards, mask, shift_mean=False)
             else:
                 whitened_rewards = rewards
             
@@ -109,7 +103,7 @@ class PPOTrainer:
             returns = advantages + old_values
             
             whitened_advantages = advantages.detach()
-            whitened_advantages = whiten(advantages, mask, accelerator=self.accelerator).detach()
+            whitened_advantages = whiten(advantages, mask).detach()
 
             
         results['whitened_advantages'] = whitened_advantages
@@ -170,7 +164,6 @@ class PPOTrainer:
             self.save(step=step)
             self.valid(step=step)
 
-        self.accelerator.wait_for_everyone()
         try:
             batch = next(self.train_sampler)
         except StopIteration:
@@ -252,7 +245,7 @@ class PPOTrainer:
             
             # get the weight for each sub-batch
             mask = results['generated_attention_mask']
-            all_mask = self.accelerator.gather(mask)
+            all_mask = mask
             all_mask_weight = all_mask.sum(dim=1).float().mean().item()
             
             for batch_idx in range(0,n_results, self.args['train']['training_batch_size_per_card']):
@@ -263,7 +256,7 @@ class PPOTrainer:
             
                 self.loss(batch_results, all_mask_weight)
                 # gradient accumulation weight
-                self.accelerator.backward(batch_results['loss/total'])
+                batch_results['loss/total'].backward()
                 
                 # logging
                 if ppo_epoch_idx == self.args['train']['n_ppo_epoch_per_rollout'] - 1:
@@ -272,7 +265,7 @@ class PPOTrainer:
                     loss_value = batch_results['loss/value'].unsqueeze(0) # (1)
                     reward_penalized = torch.mean(reduce_sum(batch_results['rewards/penalized'], batch_results['generated_attention_mask'], axis=1)).unsqueeze(0) # (1)
                     reward_kl = torch.mean(reduce_sum(batch_results['rewards/kl'], batch_results['generated_attention_mask'], axis=1)).unsqueeze(0) # (1)
-                    reward_raw =  torch.mean(reduce_sum(batch_results['rewards/raw'], batch_results['generated_attention_mask'], axis=1)).unsqueeze(0) # (1)
+                    reward_raw = torch.mean(reduce_sum(batch_results['rewards/raw'], batch_results['generated_attention_mask'], axis=1)).unsqueeze(0) # (1)
 
                     loss_totals.append(loss_total)
                     loss_policies.append(loss_policy)
@@ -283,7 +276,7 @@ class PPOTrainer:
                     
                 
             if self.args['train']['clip_grad']:
-                self.accelerator.clip_grad_norm_(
+                torch.nn.utils.clip_grad_norm_(
                     chain(self.policy_model.model.parameters(),
                         self.policy_model.linear.parameters(),
                         self.value_model.model.parameters(),
@@ -300,25 +293,9 @@ class PPOTrainer:
         reward_penalized = torch.cat(reward_penalizeds, dim=0)
         reward_kl = torch.cat(reward_kls, dim=0)
         reward_raw = torch.cat(reward_raws, dim=0)
-
-        losses_total = self.accelerator.gather(loss_total) # (num_gpus)
-        losses_policy = self.accelerator.gather(loss_policy) # (num_gpus)
-
-        losses_value = self.accelerator.gather(loss_value) # (num_gpus)
-        rewards_penalized = self.accelerator.gather(reward_penalized) # (num_gpus)
-        rewards_kl = self.accelerator.gather(reward_kl) # (num_gpus)
-        rewards_raw = self.accelerator.gather(reward_raw) # (num_gpus)
-
-        loss_total = losses_total.mean().item()
-        loss_policy = losses_policy.mean().item()
-
-        loss_value = losses_value.mean().item()
-        reward_penalized = rewards_penalized.mean().item()
-        reward_kl = rewards_kl.mean().item()
-        reward_raw = rewards_raw.mean().item()
     
         # Logging
-        if self.args['logging']['wandb_log'] and self.accelerator.is_main_process:
+        if self.args['logging']['wandb_log']:
 
             this_batch_kl = np.mean(reward_kl)
 
@@ -335,16 +312,14 @@ class PPOTrainer:
                 })
                 
             if this_batch_kl > self.args['train']['kl_threshold']:
-                self.log_info(f"KL divergence {this_batch_kl} exceeds threshold {self.args['train']['kl_threshold']}")
+                print(f"KL divergence {this_batch_kl} exceeds threshold {self.args['train']['kl_threshold']}")
                 self.huge_kl_count += 1
                 if self.huge_kl_count >= 5:
                     self.should_early_stop = True
 
     def valid(self, step):
-        self.log_info(f'Evaluating [step {step}] ...')
+        print(f'Evaluating [step {step}] ...')
 
-        self.accelerator.wait_for_everyone()
-        
         self.policy_model.model.eval()
         if not self.args['model']['value_model']['policy_value_sharing']:
             self.value_model.model.eval()
@@ -355,7 +330,7 @@ class PPOTrainer:
         n_entries = 0
         
         with torch.no_grad():
-            for i, batch in enumerate(tqdm(self.eval_dataloader) if self.accelerator.is_main_process else self.eval_dataloader):
+            for i, batch in enumerate(self.eval_dataloader):
 
                 results = self.policy_model.sample(
                     prompts_input_ids=batch['prompts_input_ids'],
@@ -372,86 +347,76 @@ class PPOTrainer:
                     metadata = batch['metadata'],
                 )
                 
-                # gather all results
-                batch = self.accelerator.gather_for_metrics(batch)
-                results = self.accelerator.gather_for_metrics(results)
-                
                 for eval_k, eval_v in eval_results.items():
-                    eval_results[eval_k] = self.accelerator.gather(
-                        torch.tensor(eval_v, device=results['generated_input_ids'].device))
+                    eval_results[eval_k] = torch.tensor(eval_v, device=results['generated_input_ids'].device)
                     
                 # initialize wandb table if it does not exist
                 if wandb_table is None:
                     columns.extend(list(eval_results.keys())) 
                     wandb_table = wandb.Table(columns=columns)
-                
-                if self.accelerator.is_main_process:
-                    
-                    prompt_inputs = self.policy_model.tokenizer.batch_decode(results['prompts_input_ids'],
-                                                                  skip_special_tokens=True, 
-                                                                  clean_up_tokenization_spaces=True)
-                    
-                    generated_texts = self.policy_model.tokenizer.batch_decode(results['generated_input_ids'],
-                                                                  skip_special_tokens=True, 
-                                                                  clean_up_tokenization_spaces=True)
-                    
-                    this_data_batch_size = results['prompts_input_ids'].shape[0]
-                    this_lens = torch.sum(results['generated_attention_mask'], dim=-1)
-                    
-                    for batch_i in range(this_data_batch_size):
-                        
-                        this_entry = [step, prompt_inputs[batch_i], generated_texts[batch_i]]
-                        
-                        for eval_v in eval_results.values():
-                            this_entry.append(eval_v[batch_i].item())
-                        
-                        wandb_table.add_data(*this_entry)
-                        n_entries += 1
 
-        if self.accelerator.is_main_process:
-    
-            # do statistics        
-            n_dev_samples = len(wandb_table.data)
-            
-            stats = {'eval/step': step,
-                     f'eval_generation/step_{step}': wandb_table}
-            
-            value_columns = columns[3:] # the first three are steps, inputs, outputs
-            stats.update(self.reward_model.aggregate_metrics(wandb_table, value_columns))
-            
-            
-            if self.args['logging']['wandb_log']:
-                wandb.log(stats)
+                prompt_inputs = self.policy_model.tokenizer.batch_decode(results['prompts_input_ids'],
+                                                              skip_special_tokens=True,
+                                                              clean_up_tokenization_spaces=True)
 
-            mean_rewards = stats["eval/rewards"]
-        
-            self.log_info(f'Evaluated [step {step}] rewards = {mean_rewards:.4f}')
-            
-            prev_best_step = None if len(self.eval_accs) == 0 else max(self.eval_accs, key=self.eval_accs.get)
-            self.eval_accs[step] = mean_rewards
-            if prev_best_step is None or mean_rewards > self.eval_accs[prev_best_step]:
-                if prev_best_step is not None:
-                    try:
-                        os.remove(f"{self.args['logging']['save_dir']}/ckp_{prev_best_step}.pth")
-                    except:
-                        self.log_info(f'Cannot remove previous best ckpt!')
-                shutil.copy(f"{self.args['logging']['save_dir']}/last.pth", f"{self.args['logging']['save_dir']}/ckp_{step}.pth")
-                self.log_info(f'Best ckpt updated to [step {step}]')
-                
-                # save best policy again
-                self.accelerator.wait_for_everyone()
-                policy_model_state_dict = self.accelerator.unwrap_model(self.policy_model.model).state_dict()
-                self.accelerator.save(policy_model_state_dict, f"{self.args['logging']['save_dir']}/best_policy.pth")
+                generated_texts = self.policy_model.tokenizer.batch_decode(results['generated_input_ids'],
+                                                              skip_special_tokens=True,
+                                                              clean_up_tokenization_spaces=True)
+
+                this_data_batch_size = results['prompts_input_ids'].shape[0]
+                this_lens = torch.sum(results['generated_attention_mask'], dim=-1)
+
+                for batch_i in range(this_data_batch_size):
+
+                    this_entry = [step, prompt_inputs[batch_i], generated_texts[batch_i]]
+
+                    for eval_v in eval_results.values():
+                        this_entry.append(eval_v[batch_i].item())
+
+                    wandb_table.add_data(*this_entry)
+                    n_entries += 1
+
+
+        # do statistics
+        n_dev_samples = len(wandb_table.data)
+
+        stats = {'eval/step': step,
+                 f'eval_generation/step_{step}': wandb_table}
+
+        value_columns = columns[3:] # the first three are steps, inputs, outputs
+        stats.update(self.reward_model.aggregate_metrics(wandb_table, value_columns))
+
+
+        if self.args['logging']['wandb_log']:
+            wandb.log(stats)
+
+        mean_rewards = stats["eval/rewards"]
+
+        print(f'Evaluated [step {step}] rewards = {mean_rewards:.4f}')
+
+        prev_best_step = None if len(self.eval_accs) == 0 else max(self.eval_accs, key=self.eval_accs.get)
+        self.eval_accs[step] = mean_rewards
+        if prev_best_step is None or mean_rewards > self.eval_accs[prev_best_step]:
+            if prev_best_step is not None:
+                try:
+                    os.remove(f"{self.args['logging']['save_dir']}/ckp_{prev_best_step}.pth")
+                except:
+                    print(f'Cannot remove previous best ckpt!')
+            shutil.copy(f"{self.args['logging']['save_dir']}/last.pth", f"{self.args['logging']['save_dir']}/ckp_{step}.pth")
+            print(f'Best ckpt updated to [step {step}]')
+
+            # save best policy again
+            policy_model_state_dict = self.policy_model.model.state_dict()
+            torch.save(policy_model_state_dict, f"{self.args['logging']['save_dir']}/best_policy.pth")
 
 
     def save(self, step):
         # this will overwrite an existing ckpt with the save filename!
-        self.accelerator.wait_for_everyone()
-        policy_model_state_dict = self.accelerator.unwrap_model(self.policy_model.model).state_dict()
-        policy_linear_state_dict = self.accelerator.unwrap_model(self.policy_model.linear).state_dict()
+        policy_model_state_dict = self.policy_model.model.state_dict()
+        policy_linear_state_dict = self.policy_model.linear.state_dict()
         if not self.args['model']['value_model']['policy_value_sharing']:
-            value_model_state_dict = self.accelerator.unwrap_model(self.value_model.model).state_dict()
-            value_linear_state_dict = self.accelerator.unwrap_model(self.value_model.linear).state_dict()
+            value_model_state_dict = self.value_model.model.state_dict()
+            value_linear_state_dict = self.value_model.linear.state_dict()
 
         result = {
             'model': policy_model_state_dict,
@@ -463,8 +428,7 @@ class PPOTrainer:
         if not self.args['model']['value_model']['policy_value_sharing']:
             result['value_model'] = value_model_state_dict
             result['value_linear'] = value_linear_state_dict
-        self.accelerator.wait_for_everyone()
-        self.accelerator.save(result, f"{self.args['logging']['save_dir']}/last.pth")
-        self.log_info(f'[step {step}] model checkpoint saved')
+        torch.save(result, f"{self.args['logging']['save_dir']}/last.pth")
+        print(f'[step {step}] model checkpoint saved')
 
 

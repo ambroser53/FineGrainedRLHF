@@ -21,11 +21,9 @@ class T5Policy:
                  model_ckpt: str,
                  tokenizer,
                  policy_value_sharing: bool,
-                 accelerator,
                 ):
         self.tokenizer = tokenizer
         self.policy_value_sharing = policy_value_sharing
-        self.accelerator = accelerator
 
         self.model = T5ForConditionalGeneration.from_pretrained(model_ckpt)
         
@@ -46,7 +44,7 @@ class T5Policy:
         
         prompts_text = self.tokenizer.batch_decode(prompts_input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        unwrapped_model = self.model
         
         if do_sample:
             generated_input_ids = unwrapped_model.generate(

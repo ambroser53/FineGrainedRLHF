@@ -37,11 +37,9 @@ class T5Value:
                  model_ckpt: str,
                  model,
                  tokenizer,
-                 accelerator,
                  freeze_model: bool = False,
                 ):
         self.tokenizer = tokenizer
-        self.accelerator = accelerator
         
         if model is not None:
             self.model = model
