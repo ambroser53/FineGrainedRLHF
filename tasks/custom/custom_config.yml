@@ -1,6 +1,6 @@
 model:
   policy_model:
-    ckpt: ./tasks/qa_feedback/model_outputs/t5-large-1k-train
+    ckpt: t5-base
     input_padding_side: right
     train_generation_kwargs:
       do_sample: True
@@ -14,11 +14,17 @@ model:
     ckpt: t5-base
     freeze_value_model: False
     policy_value_sharing: False
-  
+
 
 reward:
   completeness_model:
-    ckpt: ./tasks/qa_feedback/model_outputs/comp_rm
+    ckpt: allenai/longformer-base-4096
+    mean: -0.44677690555995353
+    std: 8.301160619054132
+    bias: 0.0
+    scale: 0.3
+  answerability_model:
+    ckpt: allenai/longformer-base-4096
     mean: -0.44677690555995353
     std: 8.301160619054132
     bias: 0.0
@@ -55,7 +61,7 @@ train:
 
 logging:
   run_name: finegrained
-  wandb_log: True
+  wandb_log: false
   wandb_entity: your-wandb-username
   wandb_project: RLHF
   log_interval: 1
