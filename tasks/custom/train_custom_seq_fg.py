@@ -82,9 +82,9 @@ class TextGenDataset(Dataset):
                 "prompt": task_instance['text'],
                 "metadata": {
                     "prompt": task_instance['text'],
-                    "references": task_instance['answer'],
-                    "passages": task_instance['passages'],
-                    "question": task_instance['question'],}
+                    "references": task_instance['answer'] if 'answer' in task_instance else None,
+                    "passages": task_instance['passages'] if 'passages' in task_instance else None,
+                    "question": task_instance['question'] if 'question' in task_instance else None, }
             })
 
         
